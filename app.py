@@ -35,12 +35,30 @@ ENCODER_PATH = "label_encoder.joblib"
 @st.cache_resource
 def load_assets():
     try:
-        model = tf.keras.models.load_model(MODEL_PATH)
+        # Try loading with backward compatibility
+        import os
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Reduce TensorFlow logging
+
+        try:
+            model = tf.keras.models.load_model(MODEL_PATH)
+        except Exception as e:
+            if "batch_shape" in str(e) or "InputLayer" in str(e):
+                # Try with legacy Keras format
+                try:
+                    import keras
+                    model = keras.models.load_model(MODEL_PATH)
+                except:
+                    # Try loading with compile=False
+                    model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+            else:
+                raise e
+
         scaler = joblib.load(SCALER_PATH)
         encoder = joblib.load(ENCODER_PATH)
         return model, scaler, encoder
     except Exception as e:
         st.error(f"Gagal memuat model atau file pendukung: {e}")
+        st.error("Saran: Model mungkin dibuat dengan versi TensorFlow/Keras yang berbeda. Coba install TensorFlow 2.15.0")
         st.stop()
 
 
