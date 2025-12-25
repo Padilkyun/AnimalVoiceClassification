@@ -12,8 +12,17 @@ import librosa.display
 import tensorflow as tf
 import joblib
 
-from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, WebRtcMode
-import av
+# Configure TensorFlow to use less memory
+tf.config.set_visible_devices([], 'GPU')  # Disable GPU usage
+tf.config.threading.set_inter_op_parallelism_threads(1)
+tf.config.threading.set_intra_op_parallelism_threads(1)
+
+try:
+    from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, WebRtcMode
+    import av
+    WEBRTC_AVAILABLE = True
+except ImportError:
+    WEBRTC_AVAILABLE = False
 
 
 st.set_page_config(page_title="Animal Voice Classifier (ANN)", page_icon="🐾", layout="wide")
@@ -25,10 +34,14 @@ ENCODER_PATH = "label_encoder.joblib"
 
 @st.cache_resource
 def load_assets():
-    model = tf.keras.models.load_model(MODEL_PATH)
-    scaler = joblib.load(SCALER_PATH)
-    encoder = joblib.load(ENCODER_PATH)
-    return model, scaler, encoder
+    try:
+        model = tf.keras.models.load_model(MODEL_PATH)
+        scaler = joblib.load(SCALER_PATH)
+        encoder = joblib.load(ENCODER_PATH)
+        return model, scaler, encoder
+    except Exception as e:
+        st.error(f"Gagal memuat model atau file pendukung: {e}")
+        st.stop()
 
 
 def extract_features_from_path(fp, target_sr=22050, n_mfcc=40):
@@ -208,85 +221,89 @@ with tab1:
                 pass
 
 with tab2:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("Rekam dari mikrofon")
-    st.caption("Klik Start, bicara/putar suara hewan 2–6 detik, lalu Stop. Setelah itu klik Proses Rekaman.")
-    st.markdown("</div>", unsafe_allow_html=True)
+    if not WEBRTC_AVAILABLE:
+        st.warning("🎙️ Fitur input mikrofon tidak tersedia di environment deployment ini. Gunakan tab Upload File untuk menguji model.")
+        st.info("Untuk menggunakan mikrofon, deploy aplikasi ini secara lokal atau di environment yang mendukung WebRTC.")
+    else:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader("Rekam dari mikrofon")
+        st.caption("Klik Start, bicara/putar suara hewan 2–6 detik, lalu Stop. Setelah itu klik Proses Rekaman.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    if "mic_key" not in st.session_state:
-        st.session_state.mic_key = str(int(time.time()))
-
-    colA, colB = st.columns([2.2, 1.0])
-    with colA:
-        webrtc_ctx = webrtc_streamer(
-            key=st.session_state.mic_key,
-            mode=WebRtcMode.SENDONLY,
-            audio_processor_factory=MicAudioProcessor,
-            media_stream_constraints={"video": False, "audio": True},
-            async_processing=True,
-        )
-
-    with colB:
-        if st.button("Reset Rekaman", use_container_width=True):
+        if "mic_key" not in st.session_state:
             st.session_state.mic_key = str(int(time.time()))
-            st.rerun()
 
-    if webrtc_ctx and webrtc_ctx.audio_processor:
-        if st.button("Proses Rekaman", type="primary", use_container_width=True):
-            y, sr = webrtc_ctx.audio_processor.get_audio()
-            if y is None:
-                st.warning("Belum ada audio terekam.")
-            else:
-                y = y.astype(np.float32)
-                maxv = np.max(np.abs(y)) if y.size else 1.0
-                if maxv > 0:
-                    y = y / maxv
+        colA, colB = st.columns([2.2, 1.0])
+        with colA:
+            webrtc_ctx = webrtc_streamer(
+                key=st.session_state.mic_key,
+                mode=WebRtcMode.SENDONLY,
+                audio_processor_factory=MicAudioProcessor,
+                media_stream_constraints={"video": False, "audio": True},
+                async_processing=True,
+            )
 
-                try:
-                    import soundfile as sf
-                    with tempfile.NamedTemporaryFile(delete=False, suffix="_mic.wav") as tmp:
-                        sf.write(tmp.name, y, sr)
-                        tmp_path = tmp.name
+        with colB:
+            if st.button("Reset Rekaman", use_container_width=True):
+                st.session_state.mic_key = str(int(time.time()))
+                st.rerun()
 
-                    label, conf, proba_df, yy, ssr = predict_from_tempfile(model, scaler, encoder, tmp_path)
+        if webrtc_ctx and webrtc_ctx.audio_processor:
+            if st.button("Proses Rekaman", type="primary", use_container_width=True):
+                y, sr = webrtc_ctx.audio_processor.get_audio()
+                if y is None:
+                    st.warning("Belum ada audio terekam.")
+                else:
+                    y = y.astype(np.float32)
+                    maxv = np.max(np.abs(y)) if y.size else 1.0
+                    if maxv > 0:
+                        y = y / maxv
 
-                    c1, c2, c3 = st.columns([1.2, 1.2, 1.6])
-                    with c1:
-                        st.metric("Prediksi", str(label))
-                    with c2:
-                        st.metric("Confidence", f"{conf:.3f}")
-                    with c3:
-                        st.write(f"Sample rate: {ssr} Hz")
-                        st.write(f"Durasi: {len(yy)/ssr:.2f} detik")
-
-                    st.subheader("Top Probabilitas")
-                    st.dataframe(proba_df.head(topk), use_container_width=True, hide_index=True)
-
-                    figp = plt.figure()
-                    top_df = proba_df.head(topk).iloc[::-1]
-                    plt.barh(top_df["label"], top_df["probability"])
-                    plt.title("Top-K Probability")
-                    plt.tight_layout()
-                    st.pyplot(figp)
-
-                    if show_plots:
-                        st.subheader("Visualisasi audio")
-                        st.pyplot(plot_waveform(yy, ssr, f"Waveform | {label} ({conf:.3f})"))
-                        st.pyplot(plot_melspec(yy, ssr, f"Mel-Spectrogram | {label} ({conf:.3f})"))
-
-                    wav_bytes = io.BytesIO()
-                    import soundfile as sf
-                    sf.write(wav_bytes, yy, ssr, format="WAV")
-                    st.audio(wav_bytes.getvalue())
-
-                except Exception as e:
-                    st.error(f"Gagal memproses rekaman: {e}")
-
-                finally:
                     try:
-                        os.remove(tmp_path)
-                    except Exception:
-                        pass
+                        import soundfile as sf
+                        with tempfile.NamedTemporaryFile(delete=False, suffix="_mic.wav") as tmp:
+                            sf.write(tmp.name, y, sr)
+                            tmp_path = tmp.name
+
+                        label, conf, proba_df, yy, ssr = predict_from_tempfile(model, scaler, encoder, tmp_path)
+
+                        c1, c2, c3 = st.columns([1.2, 1.2, 1.6])
+                        with c1:
+                            st.metric("Prediksi", str(label))
+                        with c2:
+                            st.metric("Confidence", f"{conf:.3f}")
+                        with c3:
+                            st.write(f"Sample rate: {ssr} Hz")
+                            st.write(f"Durasi: {len(yy)/ssr:.2f} detik")
+
+                        st.subheader("Top Probabilitas")
+                        st.dataframe(proba_df.head(topk), use_container_width=True, hide_index=True)
+
+                        figp = plt.figure()
+                        top_df = proba_df.head(topk).iloc[::-1]
+                        plt.barh(top_df["label"], top_df["probability"])
+                        plt.title("Top-K Probability")
+                        plt.tight_layout()
+                        st.pyplot(figp)
+
+                        if show_plots:
+                            st.subheader("Visualisasi audio")
+                            st.pyplot(plot_waveform(yy, ssr, f"Waveform | {label} ({conf:.3f})"))
+                            st.pyplot(plot_melspec(yy, ssr, f"Mel-Spectrogram | {label} ({conf:.3f})"))
+
+                        wav_bytes = io.BytesIO()
+                        import soundfile as sf
+                        sf.write(wav_bytes, yy, ssr, format="WAV")
+                        st.audio(wav_bytes.getvalue())
+
+                    except Exception as e:
+                        st.error(f"Gagal memproses rekaman: {e}")
+
+                    finally:
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
 
 st.divider()
 st.caption("Catatan: Model ANN ini bergantung pada kualitas label. Kalau label dataset kamu salah (misal cuma 1 kelas), semua hasil prediksi akan terlihat 'meyakinkan' tapi sebenarnya tidak valid.")
